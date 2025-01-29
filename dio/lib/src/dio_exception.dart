@@ -1,5 +1,6 @@
 import 'options.dart';
 import 'response.dart';
+import 'utils.dart' show warningLog;
 
 /// Deprecated in favor of [DioExceptionType] and will be removed in future major versions.
 @Deprecated('Use DioExceptionType instead. This will be removed in 6.0.0')
@@ -18,7 +19,7 @@ enum DioExceptionType {
   /// It occurs when url is sent timeout.
   sendTimeout,
 
-  ///It occurs when receiving timeout.
+  /// It occurs when receiving timeout.
   receiveTimeout,
 
   /// Caused by an incorrect certificate as configured by [ValidateCertificate].
@@ -86,11 +87,10 @@ class DioException implements Exception {
   }) =>
       DioException(
         type: DioExceptionType.badResponse,
-        message: 'The request returned an '
-            'invalid status code of $statusCode.',
         requestOptions: requestOptions,
         response: response,
         error: null,
+        message: _badResponseExceptionMessage(statusCode),
       );
 
   factory DioException.connectionTimeout({
@@ -100,11 +100,14 @@ class DioException implements Exception {
   }) =>
       DioException(
         type: DioExceptionType.connectionTimeout,
-        message: 'The request connection took '
-            'longer than $timeout. It was aborted.',
         requestOptions: requestOptions,
         response: null,
         error: error,
+        message: 'The request connection took longer than $timeout '
+            'and it was aborted. '
+            'To get rid of this exception, try raising the '
+            'RequestOptions.connectTimeout above the duration of $timeout or '
+            'improve the response time of the server.',
       );
 
   factory DioException.sendTimeout({
@@ -113,11 +116,14 @@ class DioException implements Exception {
   }) =>
       DioException(
         type: DioExceptionType.sendTimeout,
-        message: 'The request took '
-            'longer than $timeout to send data. It was aborted.',
         requestOptions: requestOptions,
         response: null,
         error: null,
+        message: 'The request took longer than $timeout to send data. '
+            'It was aborted. '
+            'To get rid of this exception, try raising the '
+            'RequestOptions.sendTimeout above the duration of $timeout or '
+            'improve the response time of the server.',
       );
 
   factory DioException.receiveTimeout({
@@ -127,11 +133,26 @@ class DioException implements Exception {
   }) =>
       DioException(
         type: DioExceptionType.receiveTimeout,
-        message: 'The request took '
-            'longer than $timeout to receive data. It was aborted.',
         requestOptions: requestOptions,
         response: null,
         error: error,
+        message: 'The request took longer than $timeout to receive data. '
+            'It was aborted. '
+            'To get rid of this exception, try raising the '
+            'RequestOptions.receiveTimeout above the duration of $timeout or '
+            'improve the response time of the server.',
+      );
+
+  factory DioException.badCertificate({
+    required RequestOptions requestOptions,
+    Object? error,
+  }) =>
+      DioException(
+        type: DioExceptionType.badCertificate,
+        requestOptions: requestOptions,
+        response: null,
+        error: error,
+        message: 'The certificate of the response is not approved.',
       );
 
   factory DioException.requestCancelled({
@@ -141,11 +162,11 @@ class DioException implements Exception {
   }) =>
       DioException(
         type: DioExceptionType.cancel,
-        message: 'The request was cancelled.',
         requestOptions: requestOptions,
         response: null,
         error: reason,
         stackTrace: stackTrace,
+        message: 'The request was manually cancelled by the user.',
       );
 
   factory DioException.connectionError({
@@ -155,13 +176,17 @@ class DioException implements Exception {
   }) =>
       DioException(
         type: DioExceptionType.connectionError,
-        message: 'The connection errored: $reason',
+        message: 'The connection errored: $reason '
+            'This indicates an error which most likely cannot be solved by the library.',
         requestOptions: requestOptions,
         response: null,
         error: error,
       );
 
   /// The request info for the request that throws exception.
+  ///
+  /// The info can be empty (e.g. `uri` equals to "")
+  /// if the request was never submitted.
   final RequestOptions requestOptions;
 
   /// Response info, it may be `null` if the request can't reach to the
@@ -180,6 +205,14 @@ class DioException implements Exception {
 
   /// The error message that throws a [DioException].
   final String? message;
+
+  /// Users can customize the content of [toString] when thrown.
+  static DioExceptionReadableStringBuilder readableStringBuilder =
+      defaultDioExceptionReadableStringBuilder;
+
+  /// Each exception can be override with a customized builder or fallback to
+  /// the default [DioException.readableStringBuilder].
+  DioExceptionReadableStringBuilder? stringBuilder;
 
   /// Generate a new [DioException] by combining given values and original values.
   DioException copyWith({
@@ -202,10 +235,73 @@ class DioException implements Exception {
 
   @override
   String toString() {
-    String msg = 'DioException [${type.toPrettyDescription()}]: $message';
-    if (error != null) {
-      msg += '\nError: $error';
+    try {
+      return stringBuilder?.call(this) ?? readableStringBuilder(this);
+    } catch (e, s) {
+      warningLog(e, s);
+      return defaultDioExceptionReadableStringBuilder(this);
     }
-    return msg;
   }
+
+  /// Because of [ValidateStatus] we need to consider all status codes when
+  /// creating a [DioException.badResponse].
+  static String _badResponseExceptionMessage(int statusCode) {
+    final String message;
+    if (statusCode >= 100 && statusCode < 200) {
+      message =
+          'This is an informational response - the request was received, continuing processing';
+    } else if (statusCode >= 200 && statusCode < 300) {
+      message =
+          'The request was successfully received, understood, and accepted';
+    } else if (statusCode >= 300 && statusCode < 400) {
+      message =
+          'Redirection: further action needs to be taken in order to complete the request';
+    } else if (statusCode >= 400 && statusCode < 500) {
+      message =
+          'Client error - the request contains bad syntax or cannot be fulfilled';
+    } else if (statusCode >= 500 && statusCode < 600) {
+      message =
+          'Server error - the server failed to fulfil an apparently valid request';
+    } else {
+      message =
+          'A response with a status code that is not within the range of inclusive 100 to exclusive 600'
+          'is a non-standard response, possibly due to the server\'s software';
+    }
+
+    final buffer = StringBuffer();
+
+    buffer.writeln(
+      'This exception was thrown because the response has a status code of $statusCode '
+      'and RequestOptions.validateStatus was configured to throw for this status code.',
+    );
+    buffer.writeln(
+      'The status code of $statusCode has the following meaning: "$message"',
+    );
+    buffer.writeln(
+      'Read more about status codes at https://developer.mozilla.org/en-US/docs/Web/HTTP/Status',
+    );
+    buffer.writeln(
+      'In order to resolve this exception you typically have either to verify '
+      'and fix your request code or you have to fix the server code.',
+    );
+
+    return buffer.toString();
+  }
+}
+
+/// The readable string builder's signature of
+/// [DioException.readableStringBuilder].
+typedef DioExceptionReadableStringBuilder = String Function(DioException e);
+
+/// The default implementation of building a readable string of [DioException].
+String defaultDioExceptionReadableStringBuilder(DioException e) {
+  final buffer = StringBuffer(
+    'DioException [${e.type.toPrettyDescription()}]: '
+    '${e.message}',
+  );
+  if (e.error != null) {
+    buffer.writeln();
+    buffer.write('Error: ${e.error}');
+  }
+  return buffer.toString();
 }

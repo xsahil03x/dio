@@ -7,12 +7,16 @@ typedef HeaderForEachCallback = void Function(String name, List<String> values);
 
 /// The headers class for requests and responses.
 class Headers {
-  Headers() : _map = caseInsensitiveKeyMap<List<String>>();
+  Headers({
+    this.preserveHeaderCase = false,
+  }) : _map = caseInsensitiveKeyMap<List<String>>();
 
   /// Create the [Headers] from a [Map] instance.
-  Headers.fromMap(Map<String, List<String>> map)
-      : _map = caseInsensitiveKeyMap<List<String>>(
-          map.map((k, v) => MapEntry(k.trim().toLowerCase(), v)),
+  Headers.fromMap(
+    Map<String, List<String>> map, {
+    this.preserveHeaderCase = false,
+  }) : _map = caseInsensitiveKeyMap<List<String>>(
+          map.map((k, v) => MapEntry(k.trim(), v)),
         );
 
   static const acceptHeader = 'accept';
@@ -28,6 +32,11 @@ class Headers {
 
   static final jsonMimeType = MediaType.parse(jsonContentType);
 
+  /// Whether the header key should be case-sensitive.
+  ///
+  /// Defaults to false.
+  final bool preserveHeaderCase;
+
   final Map<String, List<String>> _map;
 
   Map<String, List<String>> get map => _map;
@@ -35,7 +44,7 @@ class Headers {
   /// Returns the list of values for the header named [name]. If there
   /// is no header with the provided name, [:null:] will be returned.
   List<String>? operator [](String name) {
-    return _map[name.trim().toLowerCase()];
+    return _map[name.trim()];
   }
 
   /// Convenience method for the value for a single valued header. If
@@ -44,8 +53,12 @@ class Headers {
   /// thrown.
   String? value(String name) {
     final arr = this[name];
-    if (arr == null) return null;
-    if (arr.length == 1) return arr.first;
+    if (arr == null) {
+      return null;
+    }
+    if (arr.length == 1) {
+      return arr.first;
+    }
     throw Exception(
       '"$name" header has more than one value, please use Headers[name]',
     );
@@ -55,17 +68,21 @@ class Headers {
   /// [value] added to its list of values.
   void add(String name, String value) {
     final arr = this[name];
-    if (arr == null) return set(name, value);
+    if (arr == null) {
+      return set(name, value);
+    }
     arr.add(value);
   }
 
   /// Sets a header. The header named [name] will have all its values
   /// cleared before the value [value] is added as its value.
   void set(String name, dynamic value) {
-    if (value == null) return;
-    name = name.trim().toLowerCase();
+    if (value == null) {
+      return;
+    }
+    name = name.trim();
     if (value is List) {
-      _map[name] = value.map<String>((e) => e.toString()).toList();
+      _map[name] = value.map<String>((e) => '$e').toList();
     } else {
       _map[name] = ['$value'.trim()];
     }
@@ -74,7 +91,9 @@ class Headers {
   /// Removes a specific value for a header name.
   void remove(String name, String value) {
     final arr = this[name];
-    if (arr == null) return;
+    if (arr == null) {
+      return;
+    }
     arr.removeWhere((v) => v == value);
   }
 

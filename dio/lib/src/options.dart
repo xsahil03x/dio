@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:meta/meta.dart';
 
 import 'adapter.dart';
@@ -76,36 +78,50 @@ enum ListFormat {
 typedef ValidateStatus = bool Function(int? status);
 
 /// The type of a response decoding callback.
-typedef ResponseDecoder = String? Function(
+typedef ResponseDecoder = FutureOr<String?> Function(
   List<int> responseBytes,
   RequestOptions options,
   ResponseBody responseBody,
 );
 
-/// The type of a response encoding callback.
-typedef RequestEncoder = List<int> Function(
+/// The type of a request encoding callback.
+typedef RequestEncoder = FutureOr<List<int>> Function(
   String request,
   RequestOptions options,
 );
 
 /// The mixin class for options that provides common attributes.
 mixin OptionsMixin {
-  /// Request base url, it can contain sub paths like: https://pub.dev/api/.
-  late String baseUrl;
+  /// Request base url, it can be multiple forms:
+  ///  - Contains sub paths, e.g. `https://pub.dev/api/`.
+  ///  - Relative path on Web, e.g. `api/`.
+  String get baseUrl => _baseUrl;
+  late String _baseUrl;
+
+  set baseUrl(String value) {
+    if (value.isNotEmpty && !kIsWeb && Uri.parse(value).host.isEmpty) {
+      throw ArgumentError.value(
+        value,
+        'baseUrl',
+        'Must be a valid URL on platforms other than Web.',
+      );
+    }
+    _baseUrl = value;
+  }
 
   /// Common query parameters.
   ///
   /// List values use the default [ListFormat.multiCompatible].
   /// The value can be overridden per parameter by adding a [ListParam]
   /// object wrapping the actual List value and the desired format.
-  late Map<String, dynamic> queryParameters;
+  late Map<String, dynamic /*String|Iterable<String>*/ > queryParameters;
 
-  /// Timeout when opening url.
+  /// Timeout when opening a request.
   ///
-  /// [Dio] will throw the [DioException] with
+  /// Throws the [DioException] with
   /// [DioExceptionType.connectionTimeout] type when time out.
   ///
-  /// `null` meanings no timeout limit.
+  /// `null` or `Duration.zero` means no timeout limit.
   Duration? get connectTimeout => _connectTimeout;
   Duration? _connectTimeout;
 
@@ -117,48 +133,35 @@ mixin OptionsMixin {
   }
 }
 
-/// The base config for the Dio instance, used by [Dio.options].
+/// A set of base settings for each `Dio()`.
+/// {@template dio.options.compose_merging}
+/// [BaseOptions] and [Options] will be merged into one [RequestOptions] before
+/// sending the requests. See [Options.compose].
+/// {@endtemplate}
 class BaseOptions extends _RequestConfig with OptionsMixin {
   BaseOptions({
-    String? method,
+    super.method,
     Duration? connectTimeout,
-    Duration? receiveTimeout,
-    Duration? sendTimeout,
+    super.receiveTimeout,
+    super.sendTimeout,
     String baseUrl = '',
     Map<String, dynamic>? queryParameters,
-    Map<String, dynamic>? extra,
-    Map<String, dynamic>? headers,
-    ResponseType? responseType = ResponseType.json,
-    String? contentType,
-    ValidateStatus? validateStatus,
-    bool? receiveDataWhenStatusError,
-    bool? followRedirects,
-    int? maxRedirects,
-    bool? persistentConnection,
-    RequestEncoder? requestEncoder,
-    ResponseDecoder? responseDecoder,
-    ListFormat? listFormat,
-  })  : assert(connectTimeout == null || !connectTimeout.isNegative),
-        assert(baseUrl.isEmpty || Uri.parse(baseUrl).host.isNotEmpty),
-        super(
-          method: method,
-          receiveTimeout: receiveTimeout,
-          sendTimeout: sendTimeout,
-          extra: extra,
-          headers: headers,
-          responseType: responseType,
-          contentType: contentType,
-          validateStatus: validateStatus,
-          receiveDataWhenStatusError: receiveDataWhenStatusError,
-          followRedirects: followRedirects,
-          maxRedirects: maxRedirects,
-          persistentConnection: persistentConnection,
-          requestEncoder: requestEncoder,
-          responseDecoder: responseDecoder,
-          listFormat: listFormat,
-        ) {
-    this.queryParameters = queryParameters ?? {};
+    super.extra,
+    super.headers,
+    super.preserveHeaderCase = false,
+    super.responseType = ResponseType.json,
+    super.contentType,
+    super.validateStatus,
+    super.receiveDataWhenStatusError,
+    super.followRedirects,
+    super.maxRedirects,
+    super.persistentConnection,
+    super.requestEncoder,
+    super.responseDecoder,
+    super.listFormat,
+  }) {
     this.baseUrl = baseUrl;
+    this.queryParameters = queryParameters ?? {};
     this.connectTimeout = connectTimeout;
   }
 
@@ -173,6 +176,7 @@ class BaseOptions extends _RequestConfig with OptionsMixin {
     Duration? sendTimeout,
     Map<String, Object?>? extra,
     Map<String, Object?>? headers,
+    bool? preserveHeaderCase,
     ResponseType? responseType,
     String? contentType,
     ValidateStatus? validateStatus,
@@ -193,6 +197,7 @@ class BaseOptions extends _RequestConfig with OptionsMixin {
       sendTimeout: sendTimeout ?? this.sendTimeout,
       extra: extra ?? Map.from(this.extra),
       headers: headers ?? Map.from(this.headers),
+      preserveHeaderCase: preserveHeaderCase ?? this.preserveHeaderCase,
       responseType: responseType ?? this.responseType,
       contentType: contentType ?? this.contentType,
       validateStatus: validateStatus ?? this.validateStatus,
@@ -208,7 +213,8 @@ class BaseOptions extends _RequestConfig with OptionsMixin {
   }
 }
 
-/// Every request can pass an [Options] object which will be merged with [Dio.options]
+/// The configuration for a single request.
+/// {@macro dio.options.compose_merging}
 class Options {
   Options({
     this.method,
@@ -216,6 +222,7 @@ class Options {
     Duration? receiveTimeout,
     this.extra,
     this.headers,
+    this.preserveHeaderCase,
     this.responseType,
     this.contentType,
     this.validateStatus,
@@ -238,6 +245,7 @@ class Options {
     Duration? receiveTimeout,
     Map<String, Object?>? extra,
     Map<String, Object?>? headers,
+    bool? preserveHeaderCase,
     ResponseType? responseType,
     String? contentType,
     ValidateStatus? validateStatus,
@@ -274,6 +282,7 @@ class Options {
       receiveTimeout: receiveTimeout ?? this.receiveTimeout,
       extra: extra ?? effectiveExtra,
       headers: headers ?? effectiveHeaders,
+      preserveHeaderCase: preserveHeaderCase ?? this.preserveHeaderCase,
       responseType: responseType ?? this.responseType,
       contentType: contentType ?? this.contentType,
       validateStatus: validateStatus ?? this.validateStatus,
@@ -288,6 +297,8 @@ class Options {
     );
   }
 
+  /// Merge a [BaseOptions] with the current [Options]
+  /// and compose them into the [RequestOptions].
   RequestOptions compose(
     BaseOptions baseOpt,
     String path, {
@@ -300,7 +311,9 @@ class Options {
   }) {
     final query = <String, dynamic>{};
     query.addAll(baseOpt.queryParameters);
-    if (queryParameters != null) query.addAll(queryParameters);
+    if (queryParameters != null) {
+      query.addAll(queryParameters);
+    }
 
     final headers = caseInsensitiveKeyMap(baseOpt.headers);
     if (this.headers != null) {
@@ -322,6 +335,7 @@ class Options {
       baseUrl: baseOpt.baseUrl,
       path: path,
       data: data,
+      preserveHeaderCase: preserveHeaderCase ?? baseOpt.preserveHeaderCase,
       sourceStackTrace: sourceStackTrace ?? StackTrace.current,
       connectTimeout: baseOpt.connectTimeout,
       sendTimeout: sendTimeout ?? baseOpt.sendTimeout,
@@ -353,15 +367,24 @@ class Options {
   /// HTTP request headers.
   ///
   /// The keys of the header are case-insensitive,
-  /// e.g.: content-type and Content-Type will be treated as the same key.
+  /// e.g.: `content-type` and `Content-Type` will be treated as the same key.
   Map<String, dynamic>? headers;
+
+  /// Whether the case of header keys should be preserved.
+  ///
+  /// Defaults to false.
+  ///
+  /// This option WILL NOT take effect on these circumstances:
+  /// - XHR ([HttpRequest]) does not support handling this explicitly.
+  /// - The HTTP/2 standard only supports lowercase header keys.
+  bool? preserveHeaderCase;
 
   /// Timeout when sending data.
   ///
-  /// [Dio] will throw the [DioException] with
+  /// Throws the [DioException] with
   /// [DioExceptionType.sendTimeout] type when timed out.
   ///
-  /// `null` meanings no timeout limit.
+  /// `null` or `Duration.zero` means no timeout limit.
   Duration? get sendTimeout => _sendTimeout;
   Duration? _sendTimeout;
 
@@ -374,13 +397,16 @@ class Options {
 
   /// Timeout when receiving data.
   ///
-  /// The timeout represents the timeout during data transfer of each bytes,
-  /// rather than the overall timing during the receiving.
+  /// The timeout represents:
+  ///  - a timeout before the connection is established
+  ///    and the first received response bytes.
+  ///  - the duration during data transfer of each byte event,
+  ///    rather than the total duration of the receiving.
   ///
-  /// [Dio] will throw the [DioException] with
-  /// [DioExceptionType.receiveTimeout] type when time out.
+  /// Throws the [DioException] with
+  /// [DioExceptionType.receiveTimeout] type when timed out.
   ///
-  /// `null` meanings no timeout limit.
+  /// `null` or `Duration.zero` means no timeout limit.
   Duration? get receiveTimeout => _receiveTimeout;
   Duration? _receiveTimeout;
 
@@ -396,20 +422,20 @@ class Options {
   /// {@macro dio.interceptors.ImplyContentTypeInterceptor}
   String? contentType;
 
-  /// Indicates the type of data that the server will respond with options.
+  /// The type of data that [Dio] handles with options.
   ///
-  /// The default value is [ResponseType.json], [Dio] will parse response string
-  /// to JSON object automatically when the content-type of response is
-  /// [Headers.jsonContentType].
+  /// The default value is [ResponseType.json].
+  /// [Dio] will parse response string to JSON object automatically
+  /// when the content-type of response is [Headers.jsonContentType].
   ///
-  /// If you want to receive response data with binary bytes, use `stream`.
-  ///
-  /// If you want to receive the response data with String, use `plain`.
-  ///
-  /// If you want to receive the response data with original bytes, use `bytes`.
+  /// See also:
+  ///  - `plain` if you want to receive the data as `String`.
+  ///  - `bytes` if you want to receive the data as the complete bytes.
+  ///  - `stream` if you want to receive the data as streamed binary bytes.
   ResponseType? responseType;
 
-  /// Defines whether the request is succeed with the given status code.
+  /// Defines whether the request is considered to be successful
+  /// with the given status code.
   /// The request will be treated as succeed if the callback returns true.
   ValidateStatus? validateStatus;
 
@@ -440,12 +466,14 @@ class Options {
   /// Defaults to true.
   bool? persistentConnection;
 
-  /// The default request encoder is utf8encoder, you can set custom
-  /// encoder by this option.
+  /// The type of a request encoding callback.
+  ///
+  /// Defaults to [Utf8Encoder].
   RequestEncoder? requestEncoder;
 
-  /// The default response decoder is utf8decoder, you can set custom
-  /// decoder by this option, it will be used in [Transformer].
+  /// The type of a response decoding callback.
+  ///
+  /// Defaults to [Utf8Decoder].
   ResponseDecoder? responseDecoder;
 
   /// Indicates the format of collection data in request query parameters and
@@ -464,44 +492,28 @@ class RequestOptions extends _RequestConfig with OptionsMixin {
     this.onReceiveProgress,
     this.onSendProgress,
     this.cancelToken,
-    String? method,
-    Duration? sendTimeout,
-    Duration? receiveTimeout,
+    super.method,
+    super.sendTimeout,
+    super.receiveTimeout,
     Duration? connectTimeout,
     Map<String, dynamic>? queryParameters,
     String? baseUrl,
-    Map<String, dynamic>? extra,
-    Map<String, dynamic>? headers,
-    ResponseType? responseType,
-    String? contentType,
-    ValidateStatus? validateStatus,
-    bool? receiveDataWhenStatusError,
-    bool? followRedirects,
-    int? maxRedirects,
-    bool? persistentConnection,
-    RequestEncoder? requestEncoder,
-    ResponseDecoder? responseDecoder,
-    ListFormat? listFormat,
+    super.extra,
+    super.headers,
+    super.preserveHeaderCase,
+    super.responseType,
+    super.contentType,
+    super.validateStatus,
+    super.receiveDataWhenStatusError,
+    super.followRedirects,
+    super.maxRedirects,
+    super.persistentConnection,
+    super.requestEncoder,
+    super.responseDecoder,
+    super.listFormat,
     bool? setRequestContentTypeWhenNoPayload,
     StackTrace? sourceStackTrace,
-  })  : assert(connectTimeout == null || !connectTimeout.isNegative),
-        super(
-          method: method,
-          sendTimeout: sendTimeout,
-          receiveTimeout: receiveTimeout,
-          extra: extra,
-          headers: headers,
-          responseType: responseType,
-          contentType: contentType,
-          validateStatus: validateStatus,
-          receiveDataWhenStatusError: receiveDataWhenStatusError,
-          followRedirects: followRedirects,
-          maxRedirects: maxRedirects,
-          persistentConnection: persistentConnection,
-          requestEncoder: requestEncoder,
-          responseDecoder: responseDecoder,
-          listFormat: listFormat,
-        ) {
+  }) : assert(connectTimeout == null || !connectTimeout.isNegative) {
     this.sourceStackTrace = sourceStackTrace ?? StackTrace.current;
     this.queryParameters = queryParameters ?? {};
     this.baseUrl = baseUrl ?? '';
@@ -523,6 +535,7 @@ class RequestOptions extends _RequestConfig with OptionsMixin {
     CancelToken? cancelToken,
     Map<String, dynamic>? extra,
     Map<String, dynamic>? headers,
+    bool? preserveHeaderCase,
     ResponseType? responseType,
     String? contentType,
     ValidateStatus? validateStatus,
@@ -559,6 +572,7 @@ class RequestOptions extends _RequestConfig with OptionsMixin {
       cancelToken: cancelToken ?? this.cancelToken,
       extra: extra ?? Map.from(this.extra),
       headers: headers ?? Map.from(this.headers),
+      preserveHeaderCase: preserveHeaderCase ?? this.preserveHeaderCase,
       responseType: responseType ?? this.responseType,
       validateStatus: validateStatus ?? this.validateStatus,
       receiveDataWhenStatusError:
@@ -636,6 +650,7 @@ class _RequestConfig {
     String? method,
     Map<String, dynamic>? extra,
     Map<String, dynamic>? headers,
+    bool? preserveHeaderCase,
     String? contentType,
     ListFormat? listFormat,
     bool? followRedirects,
@@ -651,6 +666,7 @@ class _RequestConfig {
         assert(sendTimeout == null || !sendTimeout.isNegative),
         _sendTimeout = sendTimeout,
         method = method ?? 'GET',
+        preserveHeaderCase = preserveHeaderCase ?? false,
         listFormat = listFormat ?? ListFormat.multi,
         extra = extra ?? {},
         followRedirects = followRedirects ?? true,
@@ -689,6 +705,8 @@ class _RequestConfig {
       _headers[Headers.contentTypeHeader] = _defaultContentType;
     }
   }
+
+  late bool preserveHeaderCase;
 
   Duration? get sendTimeout => _sendTimeout;
   Duration? _sendTimeout;
@@ -734,4 +752,18 @@ class _RequestConfig {
   RequestEncoder? requestEncoder;
   ResponseDecoder? responseDecoder;
   late ListFormat listFormat;
+}
+
+/// {@template dio.options.FileAccessMode}
+/// The file access mode when downloading a file, corresponds to a subset of
+/// dart:io::[FileMode].
+/// {@endtemplate}
+enum FileAccessMode {
+  /// Mode for opening a file for reading and writing. The file is overwritten
+  /// if it already exists. The file is created if it does not already exist.
+  write,
+
+  /// Mode for opening a file for reading and writing to the end of it.
+  /// The file is created if it does not already exist.
+  append,
 }

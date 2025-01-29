@@ -2,14 +2,14 @@ import 'dart:async';
 import 'dart:io';
 
 import '../adapter.dart';
+import '../adapters/io_adapter.dart';
 import '../cancel_token.dart';
+import '../dio.dart';
 import '../dio_exception.dart';
 import '../dio_mixin.dart';
-import '../response.dart';
-import '../dio.dart';
 import '../headers.dart';
 import '../options.dart';
-import '../adapters/io_adapter.dart';
+import '../response.dart';
 
 /// Create the [Dio] instance for native platforms.
 Dio createDio([BaseOptions? baseOptions]) => DioForNative(baseOptions);
@@ -32,35 +32,43 @@ class DioForNative with DioMixin implements Dio {
     Map<String, dynamic>? queryParameters,
     CancelToken? cancelToken,
     bool deleteOnError = true,
+    FileAccessMode fileAccessMode = FileAccessMode.write,
     String lengthHeader = Headers.contentLengthHeader,
     Object? data,
     Options? options,
   }) async {
-    // We set the `responseType` to [ResponseType.STREAM] to retrieve the
-    // response stream.
     options ??= DioMixin.checkOptions('GET', options);
-
-    // Receive data with stream.
-    options.responseType = ResponseType.stream;
-    Response<ResponseBody> response;
+    // Manually set the `responseType` to [ResponseType.stream]
+    // to retrieve the response stream.
+    // Do not modify previous options.
+    options = options.copyWith(responseType: ResponseType.stream);
+    final Response<ResponseBody> response;
     try {
       response = await request<ResponseBody>(
         urlPath,
         data: data,
         options: options,
         queryParameters: queryParameters,
-        cancelToken: cancelToken ?? CancelToken(),
+        cancelToken: cancelToken,
       );
     } on DioException catch (e) {
       if (e.type == DioExceptionType.badResponse) {
-        if (e.response!.requestOptions.receiveDataWhenStatusError == true) {
+        final response = e.response!;
+        if (response.requestOptions.receiveDataWhenStatusError == true) {
+          final ResponseType implyResponseType;
+          final contentType = response.headers.value(Headers.contentTypeHeader);
+          if (contentType != null && contentType.startsWith('text/')) {
+            implyResponseType = ResponseType.plain;
+          } else {
+            implyResponseType = ResponseType.json;
+          }
           final res = await transformer.transformResponse(
-            e.response!.requestOptions..responseType = ResponseType.json,
-            e.response!.data as ResponseBody,
+            response.requestOptions.copyWith(responseType: implyResponseType),
+            response.data as ResponseBody,
           );
-          e.response!.data = res;
+          response.data = res;
         } else {
-          e.response!.data = null;
+          response.data = null;
         }
       }
       rethrow;
@@ -88,11 +96,14 @@ class DioForNative with DioMixin implements Dio {
     // Shouldn't call file.writeAsBytesSync(list, flush: flush),
     // because it can write all bytes by once. Consider that the file is
     // a very big size (up to 1 Gigabytes), it will be expensive in memory.
-    RandomAccessFile raf = file.openSync(mode: FileMode.write);
+    RandomAccessFile raf = file.openSync(
+      mode: fileAccessMode == FileAccessMode.write
+          ? FileMode.write
+          : FileMode.append,
+    );
 
     // Create a Completer to notify the success/error state.
     final completer = Completer<Response>();
-    Future<Response> future = completer.future;
     int received = 0;
 
     // Stream<Uint8List>
@@ -139,7 +150,7 @@ class DioForNative with DioMixin implements Dio {
           }
         }).catchError((Object e) async {
           try {
-            await subscription.cancel();
+            await subscription.cancel().catchError((_) {});
             closed = true;
             await raf.close().catchError((_) => raf);
             if (deleteOnError && file.existsSync()) {
@@ -179,25 +190,6 @@ class DioForNative with DioMixin implements Dio {
       await subscription.cancel();
       await closeAndDelete();
     });
-
-    final timeout = response.requestOptions.receiveTimeout;
-    if (timeout != null) {
-      future = future.timeout(timeout).catchError(
-        (dynamic e, StackTrace s) async {
-          await subscription.cancel();
-          await closeAndDelete();
-          if (e is TimeoutException) {
-            throw DioException.receiveTimeout(
-              timeout: timeout,
-              requestOptions: response.requestOptions,
-              error: e,
-            );
-          } else {
-            throw e;
-          }
-        },
-      );
-    }
-    return DioMixin.listenCancelForAsyncTask(cancelToken, future);
+    return DioMixin.listenCancelForAsyncTask(cancelToken, completer.future);
   }
 }

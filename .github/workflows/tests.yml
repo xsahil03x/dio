@@ -1,4 +1,4 @@
-name: Tests
+name: Verify packages abilities
 
 on:
   push:
@@ -14,136 +14,117 @@ on:
     paths-ignore:
       - "**.md"
 
+# Ensure that new pushes/updates cancel running jobs
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -leo pipefail {0}
+
 jobs:
-  format:
-    name: Check formatting
+  workflows:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        directory: [
-          "dio",
-          "example",
-          "example_flutter_app",
-          "plugins/cookie_manager",
-          "plugins/http2_adapter",
-          "plugins/native_dio_adapter"
-        ]
-    defaults:
-      run:
-        working-directory: ${{ matrix.directory }}
+        sdk: [ min, stable, beta ]
+    env:
+      TEST_PRESET: all
     steps:
-      - uses: actions/checkout@v3
-      - uses: dart-lang/setup-dart@v1.3
-        with:
-          sdk: stable
-      - run: dart format --set-exit-if-changed .
-
-  analyze:
-    needs: format
-    name: Analyze Dart-only libraries
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        directory: ["dio", "example", "plugins/cookie_manager", "plugins/http2_adapter"]
-    defaults:
-      run:
-        working-directory: ${{ matrix.directory }}
-    steps:
-      - uses: actions/checkout@v3
-      - name: Prepare Dart SDK
-        uses: dart-lang/setup-dart@v1.3
-        with:
-          sdk: stable
-      - name: Analyze
-        run: dart pub get && dart analyze --fatal-infos
-
-  analyze_flutter:
-    needs: format
-    name: Analyze Flutter libraries
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        directory: ["example_flutter_app", "plugins/native_dio_adapter"]
-    defaults:
-      run:
-        working-directory: ${{ matrix.directory }}
-    steps:
-      - uses: actions/checkout@v3
-      - name: Prepare Flutter SDK
-        uses: subosito/flutter-action@v2.8.0
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
         with:
           cache: true
-          channel: stable
-      - name: Analyze
-        run: flutter pub get && flutter analyze --fatal-infos
-
-  test_dio:
-    needs: [analyze, analyze_flutter]
-    name: Run unit tests with dio
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        sdk: [ 2.15.0, stable, beta ]
-        platform: [ vm, chrome ]
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dart-lang/setup-dart@v1.3
-        with:
-          sdk: ${{ matrix.sdk }}
+          flutter-version: ${{ matrix.sdk == 'min' && '3.3.0' || '' }}
+          channel: ${{ matrix.sdk == 'min' && '' || matrix.channel }}
       - run: |
-          chmod +x ./scripts/prepare_pinning_certs.sh
-          ./scripts/prepare_pinning_certs.sh
-        shell: bash
-      - run: dart pub get
-        working-directory: dio
-      - run: dart test --chain-stack-traces --platform=${{ matrix.platform }}
-        working-directory: dio
-
-  test_plugins:
-    needs: [analyze, analyze_flutter]
-    name: Run unit tests with plugins
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        sdk: [ 2.15.0, stable, beta ]
-        directory: ["plugins/cookie_manager", "plugins/http2_adapter"]
-    steps:
-      - uses: actions/checkout@v3
-      - uses: dart-lang/setup-dart@v1.3
+          echo TARGET_DART_SDK=${{ matrix.sdk }} >> $GITHUB_ENV
+      - name: Prepare dependencies for the project management
+        run: dart pub get
+      - uses: bluefireteam/melos-action@v3
         with:
-          sdk: ${{ matrix.sdk }}
-      - run: |
-          chmod +x ./scripts/prepare_pinning_certs.sh
-          ./scripts/prepare_pinning_certs.sh
-        shell: bash
-      - name: Install proxy
-        if: matrix.directory == 'plugins/http2_adapter'
-        run: sudo apt-get install -y squid
-      - run: dart pub get
-        working-directory: ${{ matrix.directory }}
-      - run: dart test --chain-stack-traces
-        working-directory: ${{ matrix.directory }}
-
-  test_flutter_plugins:
-    needs: [analyze, analyze_flutter]
-    name: Run unit tests with Flutter plugins
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        channel: [ min, stable, beta ]
-        directory: ["plugins/native_dio_adapter"]
-    defaults:
-      run:
-        working-directory: ${{ matrix.directory }}
-    steps:
-      - uses: actions/checkout@v3
-      - name: Prepare Flutter SDK
-        uses: subosito/flutter-action@v2.8.0
+          run-bootstrap: false
+      - name: Remove dio_web_adapter overrides
+        if: ${{ matrix.sdk == 'min' }}
+        run: rm -rf plugins/web_adapter
+      - name: Check satisfied packages
+        run: |
+          dart ./scripts/melos_packages.dart
+          echo $(cat .melos_packages) >> $GITHUB_ENV
+      - name: Melos Bootstrap
+        run: melos bootstrap
+      - name: '[Verify step] Format'
+        if: ${{ matrix.sdk == 'stable' }}
+        run: melos run format
+      - name: '[Verify step] Analyze packages'
+        if: ${{ matrix.sdk == 'stable' }}
+        run: melos run analyze
+      - name: '[Verify step] Publish dry-run'
+        if: ${{ matrix.sdk == 'stable' }}
+        run: melos run publish-dry-run
+      # Tests
+      - run: ./scripts/prepare_pinning_certs.sh
+      - name: Install proxy for tests
+        run: sudo apt-get update && sudo apt-get install -y squid mkcert
+      - name: Start local httpbun
+        run: |
+          mkcert -install
+          mkcert -cert-file '/tmp/cert.pem' -key-file '/tmp/key.pem' httpbun.local
+          echo '127.0.0.1 httpbun.local' | sudo tee --append /etc/hosts
+          docker run \
+            --name httpbun \
+            --detach \
+            --publish 443:443 \
+            --volume /tmp:/tmp:ro \
+            --env HTTPBUN_TLS_CERT=/tmp/cert.pem \
+            --env HTTPBUN_TLS_KEY=/tmp/key.pem \
+            --pull always \
+            sharat87/httpbun
+          sleep 1
+          curl --fail --silent --show-error https://httpbun.local/any
+      - name: Use httpbun.local for tests
+        run: melos run httpbun:local
+      - name: '[Verify step] Test Dart packages [VM]'
+        run: melos run test:vm
+      - name: Use httpbun.com for Web/Flutter tests
+        run: melos run httpbun:com
+      - name: '[Verify step] Test Dart packages [Chrome]'
+        run: melos run test:web:chrome
+      - name: '[Verify step] Test Dart packages [Firefox]'
+        run: melos run test:web:firefox
+      - name: '[Verify step] Test Flutter packages'
+        run: melos run test:flutter
+      - uses: actions/setup-java@v4
+        if: ${{ matrix.sdk == 'stable' }}
         with:
-          cache: true
-          flutter-version: ${{ matrix.channel == 'min' && '3.10.0' || '' }}
-          channel: ${{ matrix.channel == 'min' && 'stable' || matrix.channel }}
-      - run: flutter test
+          distribution: 'adopt'
+          java-version: '17'
+      - name: '[Verify step] Build Flutter APK'
+        if: ${{ matrix.sdk == 'stable' }}
+        run: melos run build:example:apk
+      # Coverage
+      - name: '[Coverage] Format & print test coverage'
+        if: ${{ matrix.sdk == 'stable' }}
+        run: melos run coverage:show
+      - name: '[Coverage] Create Report'
+        uses: clearlyip/code-coverage-report-action@v5
+        id: code_coverage_report
+        if: ${{ matrix.sdk == 'stable' && github.actor != 'dependabot[bot]'}}
+        with:
+          artifact_download_workflow_names: 'Verify packages abilities,coverage_baseline'
+          filename: 'coverage/cobertura.xml'
+          only_list_changed_files: true
+      - name: '[Coverage] Write PR number to file'
+        if: ${{ matrix.sdk == 'stable' && github.actor != 'dependabot[bot]'}}
+        run: echo ${{ github.event.number }} > pr_number.txt
+      - name: '[Coverage] Upload'
+        if: ${{ matrix.sdk == 'stable' && github.actor != 'dependabot[bot]'}}
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-coverage-results
+          path: |
+            coverage/cobertura.xml
+            code-coverage-results.md
+            pr_number.txt

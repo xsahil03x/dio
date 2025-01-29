@@ -5,6 +5,7 @@ class _ConnectionManager implements ConnectionManager {
   _ConnectionManager({
     Duration? idleTimeout,
     this.onClientCreate,
+    this.proxyConnectedPredicate = defaultProxyConnectedPredicate,
   }) : _idleTimeout = idleTimeout ?? const Duration(seconds: 1);
 
   /// Callback when socket created.
@@ -12,6 +13,9 @@ class _ConnectionManager implements ConnectionManager {
   /// We can set trusted certificates and handler
   /// for unverifiable certificates.
   final void Function(Uri uri, ClientSetting)? onClientCreate;
+
+  /// {@macro dio_http2_adapter.ProxyConnectedPredicate}
+  final ProxyConnectedPredicate proxyConnectedPredicate;
 
   /// Sets the idle timeout(milliseconds) of non-active persistent
   /// connections. For the sake of socket reuse feature with http/2,
@@ -30,38 +34,47 @@ class _ConnectionManager implements ConnectionManager {
   @override
   Future<ClientTransportConnection> getConnection(
     RequestOptions options,
+    List<RedirectRecord> redirects,
   ) async {
     if (_closed) {
       throw Exception(
         "Can't establish connection after [ConnectionManager] closed!",
       );
     }
-    final uri = options.uri;
-    final domain = '${uri.host}:${uri.port}';
-    _ClientTransportConnectionState? transportState = _transportsMap[domain];
+    Uri uri = options.uri;
+    if (redirects.isNotEmpty) {
+      uri = Http2Adapter.resolveRedirectUri(uri, redirects.last.location);
+    }
+    // Identify whether the connection can be reused.
+    // [Uri.scheme] is required when redirecting from non-TLS to TLS connection.
+    final transportCacheKey = '${uri.scheme}://${uri.host}:${uri.port}';
+    _ClientTransportConnectionState? transportState =
+        _transportsMap[transportCacheKey];
     if (transportState == null) {
       Future<_ClientTransportConnectionState>? initFuture =
-          _connectFutures[domain];
+          _connectFutures[transportCacheKey];
       if (initFuture == null) {
-        _connectFutures[domain] = initFuture = _connect(options);
+        _connectFutures[transportCacheKey] =
+            initFuture = _connect(options, redirects);
       }
       try {
         transportState = await initFuture;
       } catch (e) {
-        _connectFutures.remove(domain);
+        _connectFutures.remove(transportCacheKey);
         rethrow;
       }
       if (_forceClosed) {
         transportState.dispose();
       } else {
-        _transportsMap[domain] = transportState;
-        final _ = _connectFutures.remove(domain);
+        _transportsMap[transportCacheKey] = transportState;
+        final _ = _connectFutures.remove(transportCacheKey);
       }
     } else {
       // Check whether the connection is terminated, if it is, reconnecting.
       if (!transportState.transport.isOpen) {
         transportState.dispose();
-        _transportsMap[domain] = transportState = await _connect(options);
+        _transportsMap[transportCacheKey] =
+            transportState = await _connect(options, redirects);
       }
     }
     return transportState.activeTransport;
@@ -69,23 +82,28 @@ class _ConnectionManager implements ConnectionManager {
 
   Future<_ClientTransportConnectionState> _connect(
     RequestOptions options,
+    List<RedirectRecord> redirects,
   ) async {
-    final uri = options.uri;
+    Uri uri = options.uri;
+    if (redirects.isNotEmpty) {
+      uri = Http2Adapter.resolveRedirectUri(uri, redirects.last.location);
+    }
     final domain = '${uri.host}:${uri.port}';
     final clientConfig = ClientSetting();
     if (onClientCreate != null) {
       onClientCreate!(uri, clientConfig);
     }
 
-    late final SecureSocket socket;
-
+    // Allow [Socket] for non-TLS connections
+    // or [SecureSocket] for TLS connections.
+    late final Socket socket;
     try {
       socket = await _createSocket(uri, options, clientConfig);
     } on SocketException catch (e) {
       if (e.osError == null) {
         if (e.message.contains('timed out')) {
           throw DioException.connectionTimeout(
-            timeout: options.connectTimeout!,
+            timeout: options.connectTimeout ?? Duration.zero,
             requestOptions: options,
           );
         }
@@ -94,16 +112,19 @@ class _ConnectionManager implements ConnectionManager {
     }
 
     if (clientConfig.validateCertificate != null) {
+      final certificate =
+          socket is SecureSocket ? socket.peerCertificate : null;
       final isCertApproved = clientConfig.validateCertificate!(
-        socket.peerCertificate,
+        certificate,
         uri.host,
         uri.port,
       );
       if (!isCertApproved) {
+        // TODO(EVERYONE): Replace with DioException.badCertificate once upgrade dependencies Dio above 5.4.2.
         throw DioException(
           requestOptions: options,
           type: DioExceptionType.badCertificate,
-          error: socket.peerCertificate,
+          error: certificate,
           message: 'The certificate of the response is not approved.',
         );
       }
@@ -119,9 +140,8 @@ class _ConnectionManager implements ConnectionManager {
       }
     };
 
-    //
     transportState.delayClose(
-      _closed ? Duration(milliseconds: 50) : _idleTimeout,
+      _closed ? const Duration(milliseconds: 50) : _idleTimeout,
       () {
         _transportsMap.remove(domain);
         transportState.transport.finish();
@@ -130,37 +150,52 @@ class _ConnectionManager implements ConnectionManager {
     return transportState;
   }
 
-  Future<SecureSocket> _createSocket(
+  Future<Socket> _createSocket(
     Uri target,
     RequestOptions options,
     ClientSetting clientConfig,
   ) async {
-    if (clientConfig.proxy == null) {
-      return SecureSocket.connect(
+    final timeout = (options.connectTimeout ?? Duration.zero) > Duration.zero
+        ? options.connectTimeout!
+        : null;
+    final proxy = clientConfig.proxy;
+
+    if (proxy == null) {
+      if (target.scheme != 'https') {
+        return Socket.connect(
+          target.host,
+          target.port,
+          timeout: timeout,
+        );
+      }
+      final socket = await SecureSocket.connect(
         target.host,
         target.port,
-        timeout: options.connectTimeout,
+        timeout: timeout,
         context: clientConfig.context,
         onBadCertificate: clientConfig.onBadCertificate,
         supportedProtocols: ['h2'],
       );
+      _throwIfH2NotSelected(target, socket);
+      return socket;
     }
 
     final proxySocket = await Socket.connect(
-      clientConfig.proxy!.host,
-      clientConfig.proxy!.port,
-      timeout: options.connectTimeout,
+      proxy.host,
+      proxy.port,
+      timeout: timeout,
     );
 
-    final String credentialsProxy =
-        base64Encode(utf8.encode(clientConfig.proxy!.userInfo));
+    final String credentialsProxy = base64Encode(utf8.encode(proxy.userInfo));
 
     // Create http tunnel proxy https://www.ietf.org/rfc/rfc2817.txt
 
     // Use CRLF as the end of the line https://www.ietf.org/rfc/rfc2616.txt
     const crlf = '\r\n';
 
-    proxySocket.write('CONNECT ${target.host}:${target.port} HTTP/1.1');
+    // TODO(EVERYONE): Figure out why we can only use an HTTP/1.x proxy here.
+    const proxyProtocol = 'HTTP/1.1';
+    proxySocket.write('CONNECT ${target.host}:${target.port} $proxyProtocol');
     proxySocket.write(crlf);
     proxySocket.write('Host: ${target.host}:${target.port}');
 
@@ -190,18 +225,25 @@ class _ConnectionManager implements ConnectionManager {
         final response = ascii.decode(event);
         final lines = response.split(crlf);
         final statusLine = lines.first;
-
-        if (statusLine.startsWith('HTTP/1.1 200')) {
-          completerProxyInitialization.complete();
-        } else {
-          completerProxyInitialization.completeError(
-            SocketException('Proxy cannot be initialized'),
-          );
+        if (!completerProxyInitialization.isCompleted) {
+          if (proxyConnectedPredicate(proxyProtocol, statusLine)) {
+            completerProxyInitialization.complete();
+          } else {
+            completerProxyInitialization.completeError(
+              SocketException(
+                'Proxy cannot be initialized with status = [$statusLine], '
+                'host = ${target.host}, port = ${target.port}',
+              ),
+            );
+          }
         }
       },
-      onError: completerProxyInitialization.completeError,
+      onError: (e, s) {
+        if (!completerProxyInitialization.isCompleted) {
+          completerProxyInitialization.completeError(e, s);
+        }
+      },
     );
-
     await completerProxyInitialization.future;
 
     final socket = await SecureSocket.secure(
@@ -211,6 +253,7 @@ class _ConnectionManager implements ConnectionManager {
       onBadCertificate: clientConfig.onBadCertificate,
       supportedProtocols: ['h2'],
     );
+    _throwIfH2NotSelected(target, socket);
 
     proxySubscription.cancel();
 
@@ -238,22 +281,28 @@ class _ConnectionManager implements ConnectionManager {
       _transportsMap.forEach((key, value) => value.dispose());
     }
   }
+
+  void _throwIfH2NotSelected(Uri target, SecureSocket socket) {
+    if (socket.selectedProtocol != 'h2') {
+      throw DioH2NotSupportedException(target, socket.selectedProtocol);
+    }
+  }
 }
 
 class _ClientTransportConnectionState {
   _ClientTransportConnectionState(this.transport);
 
-  ClientTransportConnection transport;
+  final ClientTransportConnection transport;
+
+  bool isActive = true;
+  late DateTime latestIdleTimeStamp;
+  Timer? _timer;
 
   ClientTransportConnection get activeTransport {
     isActive = true;
     latestIdleTimeStamp = DateTime.now();
     return transport;
   }
-
-  bool isActive = true;
-  late DateTime latestIdleTimeStamp;
-  Timer? _timer;
 
   void delayClose(Duration idleTimeout, void Function() callback) {
     const duration = Duration(milliseconds: 100);

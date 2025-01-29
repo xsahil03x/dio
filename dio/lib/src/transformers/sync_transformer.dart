@@ -1,20 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import '../adapter.dart';
 import '../headers.dart';
 import '../options.dart';
 import '../transformer.dart';
+import 'util/consolidate_bytes.dart';
 
 @Deprecated('Use BackgroundTransformer instead')
 typedef DefaultTransformer = SyncTransformer;
-
-/// The callback definition for decoding a JSON string.
-typedef JsonDecodeCallback = FutureOr<dynamic> Function(String);
-
-/// The callback definition for encoding a JSON object.
-typedef JsonEncodeCallback = FutureOr<String> Function(Object);
 
 /// If you want to custom the transformation of request/response data,
 /// you can provide a [Transformer] by your self, and replace
@@ -30,14 +24,7 @@ class SyncTransformer extends Transformer {
 
   @override
   Future<String> transformRequest(RequestOptions options) async {
-    final dynamic data = options.data ?? '';
-    if (data is! String && Transformer.isJsonMimeType(options.contentType)) {
-      return jsonEncodeCallback(data);
-    } else if (data is Map<String, dynamic>) {
-      return Transformer.urlEncodeMap(data, options.listFormat);
-    } else {
-      return data.toString();
-    }
+    return Transformer.defaultTransformRequest(options, jsonEncodeCallback);
   }
 
   @override
@@ -51,58 +38,7 @@ class SyncTransformer extends Transformer {
       return responseBody;
     }
 
-    final showDownloadProgress = options.onReceiveProgress != null;
-    final int totalLength;
-    if (showDownloadProgress) {
-      totalLength = int.parse(
-        responseBody.headers[Headers.contentLengthHeader]?.first ?? '-1',
-      );
-    } else {
-      totalLength = 0;
-    }
-
-    int received = 0;
-    final stream = responseBody.stream.transform<Uint8List>(
-      StreamTransformer.fromHandlers(
-        handleData: (data, sink) {
-          sink.add(data);
-          if (showDownloadProgress) {
-            received += data.length;
-            options.onReceiveProgress?.call(received, totalLength);
-          }
-        },
-      ),
-    );
-
-    final streamCompleter = Completer<void>();
-    int finalLength = 0;
-    // Keep references to the data chunks and concatenate them later.
-    final chunks = <Uint8List>[];
-    final subscription = stream.listen(
-      (chunk) {
-        finalLength += chunk.length;
-        chunks.add(chunk);
-      },
-      onError: (Object error, StackTrace stackTrace) {
-        streamCompleter.completeError(error, stackTrace);
-      },
-      onDone: () {
-        streamCompleter.complete();
-      },
-      cancelOnError: true,
-    );
-    options.cancelToken?.whenCancel.then((_) {
-      return subscription.cancel();
-    });
-    await streamCompleter.future;
-
-    // Copy all chunks into the final bytes.
-    final responseBytes = Uint8List(finalLength);
-    int chunkOffset = 0;
-    for (final chunk in chunks) {
-      responseBytes.setAll(chunkOffset, chunk);
-      chunkOffset += chunk.length;
-    }
+    final responseBytes = await consolidateBytes(responseBody.stream);
 
     // Return the finalized bytes if the response type is bytes.
     if (responseType == ResponseType.bytes) {
@@ -114,11 +50,17 @@ class SyncTransformer extends Transformer {
     );
     final String? response;
     if (options.responseDecoder != null) {
-      response = options.responseDecoder!(
+      final decodeResponse = options.responseDecoder!(
         responseBytes,
         options,
-        responseBody..stream = Stream.empty(),
+        responseBody..stream = const Stream.empty(),
       );
+
+      if (decodeResponse is Future) {
+        response = await decodeResponse;
+      } else {
+        response = decodeResponse;
+      }
     } else if (!isJsonContent || responseBytes.isNotEmpty) {
       response = utf8.decode(responseBytes, allowMalformed: true);
     } else {

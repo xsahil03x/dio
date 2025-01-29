@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:dio/dio.dart';
+import 'package:dio/src/dio_mixin.dart';
 import 'package:dio/src/interceptors/imply_content_type.dart';
 import 'package:test/test.dart';
 
@@ -17,6 +18,88 @@ class MyInterceptor extends Interceptor {
 }
 
 void main() {
+  test('Throws precise StateError for duplicate calls', () async {
+    const message = 'The `handler` has already been called, '
+        'make sure each handler gets called only once.';
+    final duplicateRequestCallsDio = Dio()
+      ..options.baseUrl = MockAdapter.mockBase
+      ..httpClientAdapter = MockAdapter()
+      ..interceptors.add(
+        InterceptorsWrapper(
+          onRequest: (options, handler) {
+            handler.next(options);
+            handler.next(options);
+          },
+        ),
+      );
+    final duplicateResponseCalls = Dio()
+      ..options.baseUrl = MockAdapter.mockBase
+      ..httpClientAdapter = MockAdapter()
+      ..interceptors.add(
+        InterceptorsWrapper(
+          onResponse: (response, handler) {
+            handler.resolve(response);
+            handler.resolve(response);
+          },
+        ),
+      );
+    final duplicateErrorCalls = Dio()
+      ..options.baseUrl = MockAdapter.mockBase
+      ..httpClientAdapter = MockAdapter()
+      ..interceptors.add(
+        InterceptorsWrapper(
+          onError: (error, handler) {
+            handler.resolve(Response(requestOptions: error.requestOptions));
+            handler.resolve(Response(requestOptions: error.requestOptions));
+          },
+        ),
+      );
+    await expectLater(
+      duplicateRequestCallsDio.get('/test'),
+      throwsA(
+        allOf([
+          isA<DioException>(),
+          (DioException e) => e.error is StateError,
+          (DioException e) => (e.error as StateError).message == message,
+        ]),
+      ),
+    );
+    await expectLater(
+      duplicateResponseCalls.get('/test'),
+      throwsA(
+        allOf([
+          isA<DioException>(),
+          (DioException e) => e.error is StateError,
+          (DioException e) => (e.error as StateError).message == message,
+        ]),
+      ),
+    );
+    await expectLater(
+      duplicateErrorCalls.get('/'),
+      throwsA(
+        allOf([
+          isA<DioException>(),
+          (DioException e) => e.error is StateError,
+          (DioException e) => (e.error as StateError).message == message,
+        ]),
+      ),
+    );
+  });
+
+  group('InterceptorState', () {
+    test('toString()', () {
+      final data = DioException(requestOptions: RequestOptions());
+      final state = InterceptorState<DioException>(data);
+      expect(
+        state.toString(),
+        'InterceptorState<DioException>('
+        'type: InterceptorResultType.next, '
+        'data: DioException [unknown]: null'
+        ')',
+      );
+    });
+  });
+
   group('Request Interceptor', () {
     test('interceptor chain', () async {
       final dio = Dio();
@@ -111,24 +194,24 @@ void main() {
                   handler.next(response); //continue
               }
             },
-            onError: (err, handler) {
-              if (err.requestOptions.path == '/reject-next-response') {
+            onError: (error, handler) {
+              if (error.requestOptions.path == '/reject-next-response') {
                 handler.resolve(
                   Response(
-                    requestOptions: err.requestOptions,
+                    requestOptions: error.requestOptions,
                     data: 100,
                   ),
                 );
-              } else if (err.requestOptions.path ==
+              } else if (error.requestOptions.path ==
                   '/resolve-next/reject-next') {
-                handler.next(err.copyWith(error: 1));
+                handler.next(error.copyWith(error: 1));
               } else {
-                if (err.requestOptions.path == '/reject-next/reject') {
-                  handler.reject(err);
+                if (error.requestOptions.path == '/reject-next/reject') {
+                  handler.reject(error);
                 } else {
-                  int count = err.error as int;
+                  int count = error.error as int;
                   count++;
-                  handler.next(err.copyWith(error: count));
+                  handler.next(error.copyWith(error: count));
                 }
               }
             },
@@ -148,15 +231,15 @@ void main() {
                   handler.next(response); //continue
               }
             },
-            onError: (err, handler) {
-              if (err.requestOptions.path == '/resolve-next/reject-next') {
-                int count = err.error as int;
+            onError: (error, handler) {
+              if (error.requestOptions.path == '/resolve-next/reject-next') {
+                int count = error.error as int;
                 count++;
-                handler.next(err.copyWith(error: count));
+                handler.next(error.copyWith(error: count));
               } else {
-                int count = err.error as int;
+                int count = error.error as int;
                 count++;
-                handler.next(err.copyWith(error: count));
+                handler.next(error.copyWith(error: count));
               }
             },
           ),
@@ -218,8 +301,8 @@ void main() {
             }
             handler.next(reqOpt.copyWith(path: '/xxx'));
           },
-          onError: (err, handler) {
-            handler.next(err.copyWith(error: 'unexpected error'));
+          onError: (error, handler) {
+            handler.next(error.copyWith(error: 'unexpected error'));
           },
         ),
       );
@@ -318,6 +401,31 @@ void main() {
       expect(response.data['errCode'], 0);
     });
 
+    test('Caught exceptions before handler called', () async {
+      final dio = Dio();
+      const errorMsg = 'interceptor error';
+      dio.interceptors.add(
+        InterceptorsWrapper(
+          // TODO(EVERYONE): Remove the ignorance once we migrated to a higher version of Dart.
+          // ignore: void_checks
+          onRequest: (response, handler) {
+            throw UnsupportedError(errorMsg);
+          },
+        ),
+      );
+      expect(
+        dio.get('https://www.cloudflare.com'),
+        throwsA(
+          isA<DioException>().having(
+            (dioException) => dioException.error,
+            'Exception',
+            isA<UnsupportedError>()
+                .having((e) => e.message, 'message', errorMsg),
+          ),
+        ),
+      );
+    });
+
     group(ImplyContentTypeInterceptor, () {
       Dio createDio() {
         final dio = Dio();
@@ -383,7 +491,7 @@ void main() {
           '/echo',
           data: [
             {'hello': 'here'},
-            {'hello': 'there'}
+            {'hello': 'there'},
           ],
         );
         expect(response.requestOptions.contentType, 'application/json');
@@ -403,7 +511,7 @@ void main() {
     });
   });
 
-  group('response interceptor', () {
+  group('Response interceptor', () {
     Dio dio;
     test('Response Interceptor', () async {
       const urlNotFound = '/404/';
@@ -421,15 +529,16 @@ void main() {
             response.data = response.data['data'];
             handler.next(response);
           },
-          onError: (DioException e, ErrorInterceptorHandler handler) {
-            if (e.response?.requestOptions != null) {
-              switch (e.response!.requestOptions.path) {
+          onError: (DioException error, ErrorInterceptorHandler handler) {
+            final response = error.response;
+            if (response != null) {
+              switch (response.requestOptions.path) {
                 case urlNotFound:
-                  return handler.next(e);
+                  return handler.next(error);
                 case urlNotFound1:
                   return handler.resolve(
                     Response(
-                      requestOptions: e.requestOptions,
+                      requestOptions: error.requestOptions,
                       data: 'fake data',
                     ),
                   );
@@ -437,18 +546,18 @@ void main() {
                   return handler.resolve(
                     Response(
                       data: 'fake data',
-                      requestOptions: e.requestOptions,
+                      requestOptions: error.requestOptions,
                     ),
                   );
                 case urlNotFound3:
                   return handler.next(
-                    e.copyWith(
-                      error: 'custom error info [${e.response!.statusCode}]',
+                    error.copyWith(
+                      error: 'custom error info [${response.statusCode}]',
                     ),
                   );
               }
             }
-            handler.next(e);
+            handler.next(error);
           },
         ),
       );
@@ -514,17 +623,17 @@ void main() {
         ..options.baseUrl = MockAdapter.mockBase
         ..interceptors.add(
           InterceptorsWrapper(
-            onError: (DioException e, ErrorInterceptorHandler handler) {
-              iError = e;
-              handler.next(e);
+            onError: (DioException error, ErrorInterceptorHandler handler) {
+              iError = error;
+              handler.next(error);
             },
           ),
         )
         ..interceptors.add(
           QueuedInterceptorsWrapper(
-            onError: (DioException e, ErrorInterceptorHandler handler) {
-              qError = e;
-              handler.next(e);
+            onError: (DioException error, ErrorInterceptorHandler handler) {
+              qError = error;
+              handler.next(error);
             },
           ),
         );
@@ -572,17 +681,20 @@ void main() {
 
       int result = 0;
       void onResult(d) {
-        if (tokenRequestCounts > 0) ++result;
+        if (tokenRequestCounts > 0) {
+          ++result;
+        }
       }
 
       await Future.wait([
         dio.get('/test?tag=1').then(onResult),
         dio.get('/test?tag=2').then(onResult),
-        dio.get('/test?tag=3').then(onResult)
+        dio.get('/test?tag=3').then(onResult),
       ]);
       expect(tokenRequestCounts, 1);
       expect(result, 3);
       expect(myInter.requestCount, predicate((int e) => e > 0));
+      // The `ImplyContentTypeInterceptor` will be replaced.
       dio.interceptors[0] = myInter;
       dio.interceptors.clear();
       expect(dio.interceptors.isEmpty, true);
@@ -638,13 +750,15 @@ void main() {
 
       int result = 0;
       void onResult(d) {
-        if (tokenRequestCounts > 0) ++result;
+        if (tokenRequestCounts > 0) {
+          ++result;
+        }
       }
 
       await Future.wait([
         dio.get('/test-auth?tag=1').then(onResult),
         dio.get('/test-auth?tag=2').then(onResult),
-        dio.get('/test-auth?tag=3').then(onResult)
+        dio.get('/test-auth?tag=3').then(onResult),
       ]);
       expect(tokenRequestCounts, 1);
       expect(result, 3);
@@ -659,6 +773,9 @@ void main() {
     expect(interceptors.length, equals(2));
     expect(interceptors, isNotEmpty);
     interceptors.clear();
+    expect(interceptors.length, equals(1));
+    expect(interceptors.single, isA<ImplyContentTypeInterceptor>());
+    interceptors.clear(keepImplyContentTypeInterceptor: false);
     expect(interceptors.length, equals(0));
     expect(interceptors, isEmpty);
   });

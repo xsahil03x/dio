@@ -19,9 +19,11 @@ body:
       description: Which package has a problem?
       options:
         - dio
+        - compatibility_layer
         - cookie_manager
         - http2_adapter
         - native_dio_adapter
+        - web_adapter
     validations:
       required: true
   - type: input
@@ -30,6 +32,34 @@ body:
       label: Version
       placeholder: 1.2.3
       description: Which version of that package do you use?
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating-System
+      description: On which OS does the problem occur?
+      multiple: true
+      options:
+        - Android
+        - iOS
+        - Web
+        - MacOS
+        - Linux
+        - Windows
+    validations:
+      required: true
+  - type: dropdown
+    id: adapter
+    attributes:
+      label: Adapter
+      description: Which adapter(s) are used?
+      multiple: true
+      options:
+        - Default Dio
+        - NativeAdapter
+        - Http2Adapter
+        - ConversionLayerAdapter
     validations:
       required: true
   - type: textarea

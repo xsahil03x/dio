@@ -1,6 +1,8 @@
 /// A powerful HTTP client for Dart and Flutter, which supports global settings,
 /// [Interceptors], [FormData], aborting and canceling a request,
 /// files uploading and downloading, requests timeout, custom adapters, etc.
+/// {@category Migration Guide}
+/// {@category Plugins}
 library dio;
 
 export 'src/adapter.dart';
@@ -17,5 +19,3 @@ export 'src/parameter.dart';
 export 'src/redirect_record.dart';
 export 'src/response.dart';
 export 'src/transformer.dart';
-export 'src/transformers/background_transformer.dart';
-export 'src/transformers/sync_transformer.dart';
